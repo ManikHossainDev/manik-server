@@ -1,9 +1,8 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const bcrypt = require("bcrypt");
-const { MongoClient } = require("mongodb");
-const jwt = require("jsonwebtoken");
+const nodemailer = require("nodemailer");
+const mongoose = require("mongoose");
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -12,99 +11,124 @@ const port = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-// MongoDB Connection URL
-const uri = process.env.MONGODB_URI;
-const client = new MongoClient(uri, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
+// ========================
+// MongoDB Connection
+// ========================
+mongoose
+  .connect(process.env.MONGODB_URI, { dbName: "subscriptions" })
+  .then(() => console.log("✅ MongoDB connected successfully"))
+  .catch((err) => console.error("❌ MongoDB connection error:", err));
+
+// ========================
+// Email Schema
+// ========================
+const emailSchema = new mongoose.Schema({
+  email: { type: String, required: true, unique: true },
+  registeredAt: { type: Date, default: Date.now },
+});
+const Email = mongoose.model("Email", emailSchema);
+
+// ========================
+// Nodemailer Transporter
+// ========================
+const transport = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: process.env.SMTP_PORT,
+  secure: process.env.SMTP_PORT == 465,
+  auth: {
+    user: process.env.SMTP_USERNAME,
+    pass: process.env.SMTP_PASSWORD,
+  },
 });
 
-async function run() {
+// ========================
+// Send Email Function
+// ========================
+const sendEmail = async (to, subject, html) => {
   try {
-    // Connect to MongoDB
-    await client.connect();
-    console.log("Connected to MongoDB");
-
-    const db = client.db("authentication");
-    const collection = db.collection("users");
-
-    // User Registration
-    app.post("/api/v1/register", async (req, res) => {
-      const { username, email, password } = req.body;
-
-      // Check if email already exists
-      const existingUser = await collection.findOne({ email });
-      if (existingUser) {
-        return res.status(400).json({
-          success: false,
-          message: "User already exist!!!",
-        });
-      }
-
-      // Hash the password
-      const hashedPassword = await bcrypt.hash(password, 10);
-
-      // Insert user into the database
-      await collection.insertOne({
-        username,
-        email,
-        password: hashedPassword,
-        role: "user",
-      });
-
-      res.status(201).json({
-        success: true,
-        message: "User registered successfully!",
-      });
+    await transport.sendMail({
+      from: `"Waitlist App" <${process.env.SMTP_USERNAME}>`,
+      to,
+      subject,
+      html,
     });
-
-    // User Login
-    app.post("/api/v1/login", async (req, res) => {
-      const { email, password } = req.body;
-
-      // Find user by email
-      const user = await collection.findOne({ email });
-      if (!user) {
-        return res.status(401).json({ message: "Invalid email or password" });
-      }
-
-      // Compare hashed password
-      const isPasswordValid = await bcrypt.compare(password, user.password);
-      if (!isPasswordValid) {
-        return res.status(401).json({ message: "Invalid email or password" });
-      }
-
-      // Generate JWT token
-      const token = jwt.sign(
-        { email: user.email, role: user.role },
-        process.env.JWT_SECRET,
-        {
-          expiresIn: process.env.EXPIRES_IN,
-        }
-      );
-
-      res.json({
-        success: true,
-        message: "User successfully logged in!",
-        accessToken: token,
-      });
-    });
-
-    // Start the server
-    app.listen(port, () => {
-      console.log(`Server is running on http://localhost:${port}`);
-    });
-  } finally {
+    console.log(`📩 Email sent to ${to}`);
+    return true;
+  } catch (err) {
+    console.error(`❌ Error sending email to ${to}:`, err.message);
+    return false;
   }
-}
+};
 
-run().catch(console.dir);
+// ========================
+// Subscribe (Save + Send Email)
+// ========================
+app.post("/sendMessage", async (req, res) => {
+  const { email } = req.body;
 
-// Test route
+  if (!email) return res.status(400).json({ message: "Email is required." });
+
+  try {
+    // Check if already subscribed
+    const existingEmail = await Email.findOne({ email });
+    if (existingEmail) {
+      return res.status(400).json({ message: "This email is already subscribed." });
+    }
+
+    // Save email
+    const newEmail = new Email({ email });
+    await newEmail.save();
+
+    // Send confirmation email
+    const subject = "Subscription Confirmation";
+    const html = `
+      <div style="font-family:Arial,sans-serif;padding:20px;background:#f4f4f4;">
+        <div style="max-width:600px;margin:auto;background:#fff;padding:20px;border-radius:8px;text-align:center;">
+          <h2 style="color:#3b82f6;">Subscription Confirmed 🎉</h2>
+          <p>Hi, your email <b>${email}</b> has been successfully subscribed.</p>
+          <p>We’ll notify you as soon as the application is available.</p>
+          <hr style="margin:20px 0;">
+          <p style="font-size:12px;color:#888;">ᯤ Developed by 
+            <a href="https://www.linkedin.com/in/manikdev" target="_blank">Manik</a>
+          </p>
+        </div>
+      </div>
+    `;
+
+    await sendEmail(email, subject, html);
+
+    res.status(200).json({
+      message: "Email subscribed and confirmation sent successfully.",
+    });
+  } catch (err) {
+    console.error("❌ Error in subscribe:", err);
+    res.status(500).json({ message: "Error subscribing email.", error: err });
+  }
+});
+
+// ========================
+// Get All Emails
+// ========================
+app.get("/emails", async (req, res) => {
+  try {
+    const emails = await Email.find().sort({ registeredAt: -1 });
+    res.status(200).json({ count: emails.length, emails });
+  } catch (err) {
+    console.error("❌ Error retrieving emails:", err);
+    res.status(500).json({ message: "Error retrieving emails.", error: err });
+  }
+});
+
+// ========================
+// Server Health Check
+// ========================
 app.get("/", (req, res) => {
-  const serverStatus = {
-    message: "Server is running smoothly",
-    timestamp: new Date(),
-  };
-  res.json(serverStatus);
+  res.json({ message: "✅ Server is running smoothly", timestamp: new Date() });
+});
+
+// ========================
+// Start Server
+// ========================
+app.listen(port, () => {
+  console.log(`🚀 Server running on http://localhost:${port}`);
 });
